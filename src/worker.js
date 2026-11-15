@@ -221,8 +221,12 @@ async function handleApi(request, env) {
     const user=await currentUser(request,env);
     if(!user||user.role!=="admin"||Number(user.admin_totp_enabled)===1)return json({error:"Administrator MFA setup is not available."},403);
     let b;try{b=await request.json()}catch{return json({error:"Invalid request body."},400)}
+    const throttleKey="mfa:"+user.phone;
+    const attempts=await env.DB.prepare("SELECT COUNT(*) AS total FROM login_attempts WHERE phone=? AND attempted_at>datetime('now','-15 minutes')").bind(throttleKey).first();
+    if(attempts.total>=8)return json({error:"Too many authenticator attempts. Wait 15 minutes and try again."},429);
     const row=await env.DB.prepare("SELECT admin_totp_secret FROM customers WHERE id=?").bind(user.id).first();
-    if(!row?.admin_totp_secret||!await verifyTotp(row.admin_totp_secret,String(b.code||"")))return json({error:"Authenticator code is incorrect. Check your device time and try again."},400);
+    if(!row?.admin_totp_secret||!await verifyTotp(row.admin_totp_secret,String(b.code||""))){await env.DB.prepare("INSERT INTO login_attempts(phone) VALUES(?)").bind(throttleKey).run();return json({error:"Authenticator code is incorrect. Check your device time and try again."},400);}
+    await env.DB.prepare("DELETE FROM login_attempts WHERE phone=?").bind(throttleKey).run();
     await env.DB.batch([
       env.DB.prepare("UPDATE customers SET admin_totp_enabled=1,updated_at=datetime('now') WHERE id=?").bind(user.id),
       env.DB.prepare("UPDATE sessions SET mfa_verified=1 WHERE token_hash=?").bind(await digest(cookieToken(request))),
@@ -235,11 +239,15 @@ async function handleApi(request, env) {
     const user=await currentUser(request,env);
     if(!user||user.role!=="admin"||Number(user.admin_totp_enabled)!==1)return json({error:"Administrator MFA challenge is not available."},403);
     let b;try{b=await request.json()}catch{return json({error:"Invalid request body."},400)}
+    const throttleKey="mfa:"+user.phone;
+    const attempts=await env.DB.prepare("SELECT COUNT(*) AS total FROM login_attempts WHERE phone=? AND attempted_at>datetime('now','-15 minutes')").bind(throttleKey).first();
+    if(attempts.total>=8)return json({error:"Too many authenticator attempts. Wait 15 minutes and try again."},429);
     const row=await env.DB.prepare("SELECT admin_totp_secret FROM customers WHERE id=?").bind(user.id).first();
     const code=String(b.code||"").trim();
     let valid=!!row?.admin_totp_secret&&await verifyTotp(row.admin_totp_secret,code);
     if(!valid)valid=await verifyRecoveryCode(env,user.id,code);
-    if(!valid)return json({error:"Authenticator or recovery code is invalid."},400);
+    if(!valid){await env.DB.prepare("INSERT INTO login_attempts(phone) VALUES(?)").bind(throttleKey).run();return json({error:"Authenticator or recovery code is invalid."},400);}
+    await env.DB.prepare("DELETE FROM login_attempts WHERE phone=?").bind(throttleKey).run();
     await env.DB.prepare("UPDATE sessions SET mfa_verified=1 WHERE token_hash=?").bind(await digest(cookieToken(request))).run();
     await audit(env,user,"admin.mfa_verified","customer",user.id);
     return json({ok:true,message:"Administrator verification successful."});
