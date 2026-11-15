@@ -112,6 +112,24 @@ async function handleApi(request, env) {
     await audit(env, { id: user.id }, "admin.bootstrapped", "customer", user.id);
     return json({ ok: true, message: "Administrator access enabled. Sign in again to refresh your session." });
   }
+
+  const verifyMatch = path.match(/^\/api\/verify\/(loan|schedule|payment)\/(\d+)$/);
+  if (verifyMatch && method === "GET") {
+    const kind = verifyMatch[1], id = Number(verifyMatch[2]);
+    let record = null;
+    if (kind === "loan") {
+      record = await env.DB.prepare("SELECT l.id,l.status,l.amount_ugx,l.purpose,l.term_months,l.created_at,t.total_payable_ugx,t.monthly_rate_bps,t.disbursement_date FROM loan_applications l JOIN loan_terms t ON t.application_id=l.id WHERE l.id=? AND l.status='approved'").bind(id).first();
+      if (record) record = { reference: "SPORE-LOAN-" + String(record.id).padStart(6,"0"), type: "Loan agreement record", status: "valid", applicationId: record.id, principal: record.amount_ugx, totalPayable: record.total_payable_ugx, termMonths: record.term_months, monthlyRateBps: record.monthly_rate_bps, disbursementDate: record.disbursement_date };
+    } else if (kind === "schedule") {
+      record = await env.DB.prepare("SELECT s.id,s.application_id,s.installment_no,s.due_date,s.amount_due_ugx,s.status,l.status AS loan_status FROM repayment_schedule s JOIN loan_applications l ON l.id=s.application_id WHERE s.id=? AND l.status='approved'").bind(id).first();
+      if (record) record = { reference: "SPORE-SCHEDULE-" + String(record.id).padStart(6,"0"), type: "Repayment schedule instalment", status: "valid", applicationId: record.application_id, instalment: record.installment_no, dueDate: record.due_date, amountDue: record.amount_due_ugx, paymentStatus: record.status };
+    } else {
+      record = await env.DB.prepare("SELECT r.id,r.application_id,r.amount_ugx,r.reference,r.paid_at,l.status AS loan_status FROM repayments r JOIN loan_applications l ON l.id=r.application_id WHERE r.id=? AND l.status='approved'").bind(id).first();
+      if (record) record = { reference: "SPORE-RECEIPT-" + String(record.id).padStart(6,"0"), type: "Payment receipt", status: "recorded", applicationId: record.application_id, amount: record.amount_ugx, paymentReference: record.reference || null, paidAt: record.paid_at, settlementNotice: "Recorded by an administrator; not independently confirmed by a payment provider." };
+    }
+    return record ? json({ verified: true, document: record }) : json({ verified: false, error: "Document reference not found or no longer valid." }, 404);
+  }
+
   const user = await currentUser(request, env);
   if (path === "/api/me" && method === "GET") return user ? json({ user: safeUser(user) }) : json({ error: "Please sign in." }, 401);
   if (path === "/api/loans" && method === "POST") {
@@ -152,6 +170,17 @@ async function handleApi(request, env) {
     if (!user) return json({error:"Please sign in."},401);
     const {results}=await env.DB.prepare("SELECT s.*,l.amount_ugx,l.purpose,t.monthly_rate_bps FROM repayment_schedule s JOIN loan_applications l ON l.id=s.application_id JOIN loan_terms t ON t.application_id=l.id WHERE l.customer_id=? ORDER BY s.due_date,s.installment_no").bind(user.id).all();
     return json({schedules:results||[]});
+  }
+
+
+  if (path === "/api/my/documents" && method === "GET") {
+    if (!user) return json({ error: "Please sign in." }, 401);
+    const [loans,schedules,payments] = await Promise.all([
+      env.DB.prepare("SELECT l.id,l.amount_ugx,l.purpose,l.term_months,l.status,l.created_at,t.principal_ugx,t.monthly_rate_bps,t.total_interest_ugx,t.total_payable_ugx,t.disbursement_date,t.first_due_date FROM loan_applications l JOIN loan_terms t ON t.application_id=l.id WHERE l.customer_id=? AND l.status='approved' ORDER BY l.id DESC").bind(user.id).all(),
+      env.DB.prepare("SELECT s.id,s.application_id,s.installment_no,s.due_date,s.principal_due_ugx,s.interest_due_ugx,s.amount_due_ugx,s.principal_paid_ugx,s.interest_paid_ugx,s.status FROM repayment_schedule s JOIN loan_applications l ON l.id=s.application_id WHERE l.customer_id=? AND l.status='approved' ORDER BY s.application_id,s.installment_no").bind(user.id).all(),
+      env.DB.prepare("SELECT r.id,r.application_id,r.amount_ugx,r.reference,r.paid_at,l.purpose FROM repayments r JOIN loan_applications l ON l.id=r.application_id WHERE l.customer_id=? AND l.status='approved' ORDER BY r.paid_at DESC").bind(user.id).all()
+    ]);
+    return json({ loans: loans.results || [], schedules: schedules.results || [], payments: payments.results || [] });
   }
 
   if (path.startsWith("/api/admin/")) {
@@ -246,7 +275,7 @@ async function handleApi(request, env) {
         }
       }
       await audit(env,user,"repayment.recorded","loan_application",applicationId,{amount,reference:reference||null});
-      return json({ok:true,allocated:amount-remaining,outstanding:outstanding-amount},201);
+      return json({ok:true,repaymentId:saved.meta.last_row_id,applicationId,amount,reference:reference||null,paidAt:new Date().toISOString(),allocated:amount-remaining,outstanding:outstanding-amount},201);
     }
     return json({ error: "Admin API route not found." }, 404);
   }
