@@ -27,6 +27,15 @@ async function currentUser(request, env) {
 const sessionCookie = (token, maxAge = 604800) => `spore_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
 const validPhone = (v) => /^\+?[0-9 ()-]{7,24}$/.test(v);
 const safeUser = (u) => ({ id: u.id, fullName: u.full_name, phone: u.phone, email: u.email, role: u.role });
+async function sendSms(env, to, message) {
+  const sid=String(env.SMS_ACCOUNT_SID||""), token=String(env.SMS_AUTH_TOKEN||""), from=String(env.SMS_FROM||"");
+  if (!sid || !token || !from) throw new Error("SMS delivery is not configured.");
+  const body=new URLSearchParams({To:to,From:from,Body:message});
+  const response=await fetch("https://api.twilio.com/2010-04-01/Accounts/"+encodeURIComponent(sid)+"/Messages.json",{
+    method:"POST",headers:{"authorization":"Basic "+btoa(sid+":"+token),"content-type":"application/x-www-form-urlencoded"},body
+  });
+  if (!response.ok) throw new Error("SMS provider rejected the message.");
+}
 async function audit(env, actor, action, entityType, entityId, details = {}) {
   await env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)")
     .bind(actor?.id || null, action, entityType, entityId || null, JSON.stringify(details)).run();
@@ -101,6 +110,43 @@ async function handleApi(request, env) {
     const token = randomHex(32);
     await env.DB.prepare("INSERT INTO sessions(customer_id,token_hash,expires_at) VALUES(?,?,datetime('now','+7 days'))").bind(user.id, await digest(token)).run();
     return json({ ok: true, user: safeUser(user) }, 200, { "set-cookie": sessionCookie(token) });
+  }
+  if (path === "/api/auth/password/forgot" && method === "POST") {
+    let b; try { b=await request.json(); } catch { return json({error:"Invalid request body."},400); }
+    const phone=String(b.phone||"").trim();
+    if (!validPhone(phone)) return json({error:"Enter the phone number registered to your account."},422);
+    const recent=await env.DB.prepare("SELECT COUNT(*) AS total FROM password_resets WHERE phone=? AND created_at>datetime('now','-1 hour')").bind(phone).first();
+    if (recent.total>=3) return json({error:"Too many reset requests. Try again in one hour."},429);
+    const customer=await env.DB.prepare("SELECT id FROM customers WHERE phone=?").bind(phone).first();
+    // Return the same response for known and unknown numbers to prevent account discovery.
+    if (customer) {
+      const code=String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,"0");
+      const codeHash=await digest(phone+":"+code+":"+env.RESET_CODE_PEPPER);
+      await env.DB.prepare("INSERT INTO password_resets(phone,code_hash,expires_at) VALUES(?,?,datetime('now','+10 minutes'))").bind(phone,codeHash).run();
+      try { await sendSms(env,phone,"Your Spore Microfinance password reset code is "+code+". It expires in 10 minutes. Do not share it."); }
+      catch { await env.DB.prepare("DELETE FROM password_resets WHERE phone=?").bind(phone).run(); return json({error:"SMS delivery is temporarily unavailable. Please contact support."},503); }
+    }
+    return json({ok:true,message:"If the number is registered, a password reset code has been sent by SMS."});
+  }
+  if (path === "/api/auth/password/reset" && method === "POST") {
+    let b; try { b=await request.json(); } catch { return json({error:"Invalid request body."},400); }
+    const phone=String(b.phone||"").trim(), code=String(b.code||"").trim(), password=String(b.password||"");
+    if (!validPhone(phone) || !/^\d{6}$/.test(code) || password.length<10 || password.length>128) return json({error:"Enter the registered phone, six-digit code and a password of 10–128 characters."},422);
+    const reset=await env.DB.prepare("SELECT id,code_hash,attempts FROM password_resets WHERE phone=? AND expires_at>datetime('now') ORDER BY id DESC LIMIT 1").bind(phone).first();
+    if (!reset || reset.attempts>=5 || await digest(phone+":"+code+":"+env.RESET_CODE_PEPPER)!==reset.code_hash) {
+      if (reset) await env.DB.prepare("UPDATE password_resets SET attempts=attempts+1 WHERE id=?").bind(reset.id).run();
+      return json({error:"The reset code is invalid or expired."},400);
+    }
+    const salt=randomHex(16), hash=await passwordHash(password,salt);
+    const customer=await env.DB.prepare("SELECT id FROM customers WHERE phone=?").bind(phone).first();
+    if (!customer) return json({error:"The reset code is invalid or expired."},400);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE customers SET password_hash=?,password_salt=?,updated_at=datetime('now') WHERE id=?").bind(hash,salt,customer.id),
+      env.DB.prepare("DELETE FROM sessions WHERE customer_id=?").bind(customer.id),
+      env.DB.prepare("DELETE FROM password_resets WHERE phone=?").bind(phone),
+      env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)").bind(customer.id,"customer.password_reset","customer",customer.id,"{}")
+    ]);
+    return json({ok:true,message:"Password reset successfully. Please sign in with your new password."});
   }
   if (path === "/api/auth/logout" && method === "POST") {
     const token = cookieToken(request);
