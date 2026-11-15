@@ -50,12 +50,22 @@ function addMonthsISO(dateText, months) {
   return d.toISOString().slice(0, 10);
 }
 async function createLoanSchedule(env, loan, admin, body = {}) {
-  const existing = await env.DB.prepare("SELECT id FROM loan_terms WHERE application_id=?").bind(loan.id).first();
-  if (existing) return;
   const principal = Number(loan.amount_ugx), months = Number(loan.term_months);
+  const existing = await env.DB.prepare("SELECT id FROM loan_terms WHERE application_id=?").bind(loan.id).first();
+  if (existing) {
+    const count = await env.DB.prepare("SELECT COUNT(*) AS total FROM repayment_schedule WHERE application_id=?").bind(loan.id).first();
+    if (count.total === months) return;
+    const paid = await env.DB.prepare("SELECT COUNT(*) AS total FROM repayments WHERE application_id=?").bind(loan.id).first();
+    if (paid.total > 0) throw new Error("Existing repayment schedule is incomplete and already has payments; manual reconciliation is required.");
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM repayment_schedule WHERE application_id=?").bind(loan.id),
+      env.DB.prepare("DELETE FROM loan_terms WHERE application_id=?").bind(loan.id)
+    ]);
+  }
   const rate = Number(body.monthlyRateBps ?? 200);
   const start = /^\d{4}-\d{2}-\d{2}$/.test(String(body.disbursementDate || "")) ? body.disbursementDate : new Date().toISOString().slice(0,10);
   const first = /^\d{4}-\d{2}-\d{2}$/.test(String(body.firstDueDate || "")) ? body.firstDueDate : addMonthsISO(start, 1);
+  if (!Number.isSafeInteger(principal) || principal <= 0 || !Number.isInteger(months) || months <= 0) throw new Error("Loan principal or term is invalid.");
   if (!Number.isInteger(rate) || rate < 0 || rate > 10000) throw new Error("Monthly interest rate must be 0 to 100 percent in basis points.");
   const r = rate / 10000;
   const payment = r === 0 ? Math.ceil(principal / months) : Math.ceil(principal * r / (1 - Math.pow(1 + r, -months)));
@@ -68,10 +78,15 @@ async function createLoanSchedule(env, loan, admin, body = {}) {
     balance -= principalDue; totalInterest += interest;
     rows.push({i,due:addMonthsISO(first, i-1),principal:principalDue,interest,amount:principalDue+interest});
   }
-  await env.DB.prepare("INSERT INTO loan_terms(application_id,principal_ugx,monthly_rate_bps,total_interest_ugx,total_payable_ugx,disbursement_date,first_due_date,created_by) VALUES(?,?,?,?,?,?,?,?)")
-    .bind(loan.id, principal, rate, totalInterest, principal+totalInterest, start, first, admin.id).run();
-  for (const x of rows) await env.DB.prepare("INSERT INTO repayment_schedule(application_id,installment_no,due_date,principal_due_ugx,interest_due_ugx,amount_due_ugx) VALUES(?,?,?,?,?,?)")
-    .bind(loan.id,x.i,x.due,x.principal,x.interest,x.amount).run();
+  const statements = [
+    env.DB.prepare("INSERT INTO loan_terms(application_id,principal_ugx,monthly_rate_bps,total_interest_ugx,total_payable_ugx,disbursement_date,first_due_date,created_by) VALUES(?,?,?,?,?,?,?,?)")
+      .bind(loan.id, principal, rate, totalInterest, principal+totalInterest, start, first, admin.id)
+  ];
+  for (const x of rows) statements.push(
+    env.DB.prepare("INSERT INTO repayment_schedule(application_id,installment_no,due_date,principal_due_ugx,interest_due_ugx,amount_due_ugx) VALUES(?,?,?,?,?,?)")
+      .bind(loan.id,x.i,x.due,x.principal,x.interest,x.amount)
+  );
+  await env.DB.batch(statements);
 }
 
 async function handleApi(request, env) {
@@ -300,11 +315,13 @@ async function handleApi(request, env) {
         if (!kyc || kyc.status !== "verified") return json({ error: "Loan approval is blocked until the customer's KYC is verified." }, 409);
       }
       if (status === "approved" && exists.status === "approved") return json({ error: "This loan is already approved." }, 409);
-      await env.DB.prepare("UPDATE loan_applications SET status=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status, note, id).run();
+      // Build the complete schedule before changing the application to approved.
+      // Schedule rows and loan terms are committed together by D1 batch.
       if (status === "approved") {
         const loan = await env.DB.prepare("SELECT id,amount_ugx,term_months FROM loan_applications WHERE id=?").bind(id).first();
         await createLoanSchedule(env, loan, user, b);
       }
+      await env.DB.prepare("UPDATE loan_applications SET status=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status, note, id).run();
       await audit(env, user, "loan.status_changed", "loan_application", id, { status });
       return json({ ok: true });
     }
