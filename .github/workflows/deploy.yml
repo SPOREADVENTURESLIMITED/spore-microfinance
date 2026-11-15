@@ -29,7 +29,8 @@ jobs:
       - name: Validate Worker and portal JavaScript
         run: |
           node --check src/worker.js
-          node -e "const fs=require('fs'),vm=require('vm'),html=fs.readFileSync('public/account.html','utf8'),start=html.indexOf('<script>\\nconst 
+          node --check scripts/check-portal.js
+          node scripts/check-portal.js
 
       - name: Apply D1 migrations
         run: wrangler d1 migrations apply spore-microfinance-db --remote
