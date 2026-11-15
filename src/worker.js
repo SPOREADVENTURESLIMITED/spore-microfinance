@@ -88,8 +88,16 @@ async function handleApi(request, env) {
   if (path === "/api/auth/login" && method === "POST") {
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
     const phone = String(b.phone || "").trim(), password = String(b.password || "");
+    if (!phone || phone.length > 24 || password.length > 128) return json({ error: "Phone number or password is incorrect." }, 401);
+    await env.DB.prepare("DELETE FROM login_attempts WHERE attempted_at < datetime('now','-1 day')").run();
+    const attempts = await env.DB.prepare("SELECT COUNT(*) AS total FROM login_attempts WHERE phone=? AND attempted_at > datetime('now','-15 minutes')").bind(phone).first();
+    if (attempts.total >= 8) return json({ error: "Too many unsuccessful sign-in attempts. Please wait 15 minutes and try again." }, 429);
     const user = await env.DB.prepare("SELECT * FROM customers WHERE phone=?").bind(phone).first();
-    if (!user || (await passwordHash(password, user.password_salt)) !== user.password_hash) return json({ error: "Phone number or password is incorrect." }, 401);
+    if (!user || (await passwordHash(password, user.password_salt)) !== user.password_hash) {
+      await env.DB.prepare("INSERT INTO login_attempts(phone) VALUES(?)").bind(phone).run();
+      return json({ error: "Phone number or password is incorrect." }, 401);
+    }
+    await env.DB.prepare("DELETE FROM login_attempts WHERE phone=?").bind(phone).run();
     const token = randomHex(32);
     await env.DB.prepare("INSERT INTO sessions(customer_id,token_hash,expires_at) VALUES(?,?,datetime('now','+7 days'))").bind(user.id, await digest(token)).run();
     return json({ ok: true, user: safeUser(user) }, 200, { "set-cookie": sessionCookie(token) });
@@ -238,8 +246,13 @@ async function handleApi(request, env) {
       const status = String(b.status || ""), note = String(b.adminNote || "").slice(0, 1000);
       if (!["reviewing","approved","declined","closed"].includes(status)) return json({ error: "Invalid application status." }, 422);
       const id = Number(match[1]);
-      const exists = await env.DB.prepare("SELECT id FROM loan_applications WHERE id=?").bind(id).first();
+      const exists = await env.DB.prepare("SELECT id,customer_id,status FROM loan_applications WHERE id=?").bind(id).first();
       if (!exists) return json({ error: "Application not found." }, 404);
+      if (status === "approved") {
+        const kyc = await env.DB.prepare("SELECT status FROM kyc_profiles WHERE customer_id=?").bind(exists.customer_id).first();
+        if (!kyc || kyc.status !== "verified") return json({ error: "Loan approval is blocked until the customer's KYC is verified." }, 409);
+      }
+      if (status === "approved" && exists.status === "approved") return json({ error: "This loan is already approved." }, 409);
       await env.DB.prepare("UPDATE loan_applications SET status=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status, note, id).run();
       if (status === "approved") {
         const loan = await env.DB.prepare("SELECT id,amount_ugx,term_months FROM loan_applications WHERE id=?").bind(id).first();
@@ -258,9 +271,12 @@ async function handleApi(request, env) {
       const paid=await env.DB.prepare("SELECT COALESCE(SUM(amount_ugx),0) AS total FROM repayments WHERE application_id=?").bind(applicationId).first();
       const outstanding=terms.total_payable_ugx-paid.total;
       if (amount>outstanding) return json({error:"Payment exceeds the outstanding loan balance of UGX "+outstanding+"."},422);
-      const saved=await env.DB.prepare("INSERT INTO repayments(application_id,amount_ugx,reference,recorded_by,note) VALUES(?,?,?,?,?)").bind(applicationId,amount,reference||null,user.id,note).run();
-      let remaining=amount;
       const {results:dueRows}=await env.DB.prepare("SELECT * FROM repayment_schedule WHERE application_id=? AND status!='paid' ORDER BY due_date,installment_no").bind(applicationId).all();
+      let remaining=amount;
+      const statements = [
+        env.DB.prepare("INSERT INTO repayments(application_id,amount_ugx,reference,recorded_by,note) VALUES(?,?,?,?,?)").bind(applicationId,amount,reference||null,user.id,note)
+      ];
+      let allocated=0;
       for (const row of dueRows||[]) {
         if (remaining<=0) break;
         const interestLeft=row.interest_due_ugx-row.interest_paid_ugx;
@@ -268,14 +284,19 @@ async function handleApi(request, env) {
         const interestPart=Math.min(remaining,interestLeft); remaining-=interestPart;
         const principalPart=Math.min(remaining,principalLeft); remaining-=principalPart;
         if (interestPart+principalPart>0) {
-          await env.DB.prepare("INSERT INTO repayment_allocations(repayment_id,schedule_id,principal_ugx,interest_ugx) VALUES(?,?,?,?)").bind(saved.meta.last_row_id,row.id,principalPart,interestPart).run();
+          allocated+=interestPart+principalPart;
+          statements.push(env.DB.prepare("INSERT INTO repayment_allocations(repayment_id,schedule_id,principal_ugx,interest_ugx) SELECT id,?,?,? FROM repayments WHERE application_id=? ORDER BY id DESC LIMIT 1").bind(row.id,principalPart,interestPart,applicationId));
           const nextInterest=row.interest_paid_ugx+interestPart, nextPrincipal=row.principal_paid_ugx+principalPart;
           const status=(nextInterest>=row.interest_due_ugx && nextPrincipal>=row.principal_due_ugx)?"paid":"partial";
-          await env.DB.prepare("UPDATE repayment_schedule SET interest_paid_ugx=?,principal_paid_ugx=?,status=?,paid_at=CASE WHEN ?='paid' THEN datetime('now') ELSE paid_at END WHERE id=?").bind(nextInterest,nextPrincipal,status,status,row.id).run();
+          statements.push(env.DB.prepare("UPDATE repayment_schedule SET interest_paid_ugx=?,principal_paid_ugx=?,status=?,paid_at=CASE WHEN ?='paid' THEN datetime('now') ELSE paid_at END WHERE id=?").bind(nextInterest,nextPrincipal,status,status,row.id));
         }
       }
-      await audit(env,user,"repayment.recorded","loan_application",applicationId,{amount,reference:reference||null});
-      return json({ok:true,repaymentId:saved.meta.last_row_id,applicationId,amount,reference:reference||null,paidAt:new Date().toISOString(),allocated:amount-remaining,outstanding:outstanding-amount},201);
+      if (remaining!==0 || allocated!==amount) return json({error:"The repayment could not be fully allocated to the remaining schedule. No payment was recorded."},409);
+      statements.push(env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)").bind(user.id,"repayment.recorded","loan_application",applicationId,JSON.stringify({amount,reference:reference||null})));
+      // D1 batch executes these statements in one transaction, preventing partial payment/allocation writes.
+      const batchResult=await env.DB.batch(statements);
+      const repaymentId=batchResult[0]?.meta?.last_row_id;
+      return json({ok:true,repaymentId,applicationId,amount,reference:reference||null,paidAt:new Date().toISOString(),allocated:amount-remaining,outstanding:outstanding-amount},201);
     }
     return json({ error: "Admin API route not found." }, 404);
   }
