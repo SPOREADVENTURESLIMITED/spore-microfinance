@@ -116,6 +116,8 @@ async function handleApi(request, env) {
   if (path === "/api/me" && method === "GET") return user ? json({ user: safeUser(user) }) : json({ error: "Please sign in." }, 401);
   if (path === "/api/loans" && method === "POST") {
     if (!user) return json({ error: "Please sign in to apply." }, 401);
+    const kyc = await env.DB.prepare("SELECT status FROM kyc_profiles WHERE customer_id=?").bind(user.id).first();
+    if (!kyc || kyc.status !== "verified") return json({ error: "Complete KYC and wait for administrator verification before submitting a loan application." }, 403);
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
     const amount = Number(b.amount), term = Number(b.termMonths), purpose = String(b.purpose || "").trim(), notes = String(b.notes || "").trim();
     if (!Number.isSafeInteger(amount) || amount < 100000 || amount > 100000000) return json({ error: "Amount must be between UGX 100,000 and UGX 100,000,000." }, 422);
