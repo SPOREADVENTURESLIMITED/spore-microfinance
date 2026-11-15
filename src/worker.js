@@ -15,7 +15,7 @@ async function passwordHash(password, salt) {
 }
 const cookieToken = (request) => {
   const raw = request.headers.get("cookie") || "";
-  const match = raw.match(/(?:^|;\\s*)spore_session=([^;]+)/);
+  const match = raw.match(/(?:^|;\s*)spore_session=([^;]+)/);
   return match ? decodeURIComponent(match[1]) : "";
 };
 async function currentUser(request, env) {
@@ -25,7 +25,7 @@ async function currentUser(request, env) {
   return row || null;
 }
 const sessionCookie = (token, maxAge = 604800) => `spore_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
-const validPhone = (v) => /^\\+?[0-9 ()-]{7,24}$/.test(v);
+const validPhone = (v) => /^\+?[0-9 ()-]{7,24}$/.test(v);
 const safeUser = (u) => ({ id: u.id, fullName: u.full_name, phone: u.phone, email: u.email, role: u.role });
 async function audit(env, actor, action, entityType, entityId, details = {}) {
   await env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)")
@@ -39,7 +39,7 @@ async function handleApi(request, env) {
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
     const name = String(b.fullName || "").trim(), phone = String(b.phone || "").trim(), email = String(b.email || "").trim().toLowerCase(), password = String(b.password || "");
     if (name.length < 2 || name.length > 120 || !validPhone(phone)) return json({ error: "Enter a valid full name and phone number." }, 422);
-    if (email.length > 254 || (email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))) return json({ error: "Enter a valid email address." }, 422);
+    if (email.length > 254 || (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return json({ error: "Enter a valid email address." }, 422);
     if (password.length < 10 || password.length > 128) return json({ error: "Password must be 10–128 characters." }, 422);
     const salt = randomHex(16), hash = await passwordHash(password, salt);
     try {
@@ -111,7 +111,7 @@ async function handleApi(request, env) {
       const { results } = await env.DB.prepare("SELECT l.*,c.full_name,c.phone,c.email FROM loan_applications l JOIN customers c ON c.id=l.customer_id ORDER BY l.created_at DESC LIMIT 200").all();
       return json({ applications: results || [] });
     }
-    const match = path.match(/^\\/api\\/admin\\/loans\\/(\\d+)$/);
+    const match = path.match(/^\/api\/admin\/loans\/(\d+)$/);
     if (match && method === "PATCH") {
       let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
       const status = String(b.status || ""), note = String(b.adminNote || "").slice(0, 1000);
@@ -139,7 +139,7 @@ async function handleApi(request, env) {
     const name = String(body.name || "").trim(), phone = String(body.phone || "").trim(), email = String(body.email || "").trim();
     const type = body.type === "loan" ? "loan" : "account";
     if (name.length < 2 || name.length > 120 || !validPhone(phone)) return json({ error: "Enter a valid name and phone number." }, 422);
-    if (email.length > 254 || (email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email))) return json({ error: "Enter a valid email address." }, 422);
+    if (email.length > 254 || (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return json({ error: "Enter a valid email address." }, 422);
     let details = {};
     if (type === "loan") {
       const amount = Number(body.amount);
