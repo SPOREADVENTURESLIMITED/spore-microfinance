@@ -21,10 +21,17 @@ const cookieToken = (request) => {
 async function currentUser(request, env) {
   const token = cookieToken(request);
   if (!token || !env.DB) return null;
-  const row = await env.DB.prepare("SELECT c.id,c.full_name,c.phone,c.email,c.role FROM sessions s JOIN customers c ON c.id=s.customer_id WHERE s.token_hash=? AND s.expires_at > datetime('now')").bind(await digest(token)).first();
+  const row = await env.DB.prepare("SELECT c.id,c.full_name,c.phone,c.email,c.role,c.admin_totp_enabled,s.mfa_verified FROM sessions s JOIN customers c ON c.id=s.customer_id WHERE s.token_hash=? AND s.expires_at > datetime('now')").bind(await digest(token)).first();
   return row || null;
 }
 const sessionCookie = (token, maxAge = 604800) => `spore_session=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+const B32="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Encode(bytes){let bits=0,value=0,out="";for(const byte of bytes){value=(value<<8)|byte;bits+=8;while(bits>=5){out+=B32[(value>>>(bits-5))&31];bits-=5;}}if(bits)out+=B32[(value<<(5-bits))&31];return out;}
+function base32Decode(input){const clean=String(input||"").toUpperCase().replace(/=+$/,"").replace(/[^A-Z2-7]/g,"");let bits=0,value=0,out=[];for(const ch of clean){const n=B32.indexOf(ch);if(n<0)throw new Error("Invalid authenticator secret.");value=(value<<5)|n;bits+=5;if(bits>=8){out.push((value>>>(bits-8))&255);bits-=8;}}return new Uint8Array(out);}
+async function totpCode(secret,stepOffset=0){const counter=Math.floor(Date.now()/30000)+stepOffset;const msg=new Uint8Array(8);let n=counter;for(let i=7;i>=0;i--){msg[i]=n&255;n=Math.floor(n/256);}const key=await crypto.subtle.importKey("raw",base32Decode(secret),{name:"HMAC",hash:"SHA-1"},false,["sign"]);const mac=new Uint8Array(await crypto.subtle.sign("HMAC",key,msg));const off=mac[mac.length-1]&15;const bin=((mac[off]&127)<<24)|(mac[off+1]<<16)|(mac[off+2]<<8)|mac[off+3];return String(bin%1000000).padStart(6,"0");}
+async function verifyTotp(secret,code){for(const offset of [-1,0,1])if(await totpCode(secret,offset)===String(code))return true;return false;}
+async function verifyRecoveryCode(env,userId,code){const hash=await digest("spore-admin-recovery:"+userId+":"+String(code).replace(/[^a-f0-9]/gi,"").toLowerCase());const row=await env.DB.prepare("SELECT id FROM admin_mfa_recovery_codes WHERE customer_id=? AND code_hash=? AND used_at IS NULL").bind(userId,hash).first();if(!row)return false;await env.DB.prepare("UPDATE admin_mfa_recovery_codes SET used_at=datetime('now') WHERE id=? AND used_at IS NULL").bind(row.id).run();return true;}
+async function makeRecoveryCodes(env,userId){const codes=Array.from({length:10},()=>randomHex(8).toUpperCase());const stmts=[env.DB.prepare("DELETE FROM admin_mfa_recovery_codes WHERE customer_id=?").bind(userId)];for(const code of codes)stmts.push(env.DB.prepare("INSERT INTO admin_mfa_recovery_codes(customer_id,code_hash) VALUES(?,?)").bind(userId,await digest("spore-admin-recovery:"+userId+":"+code.toLowerCase())));await env.DB.batch(stmts);return codes;}
 const validPhone = (v) => /^\+?[0-9 ()-]{7,24}$/.test(v);
 const safeUser = (u) => ({ id: u.id, fullName: u.full_name, phone: u.phone, email: u.email, role: u.role });
 async function sendSms(env, to, message) {
@@ -123,8 +130,8 @@ async function handleApi(request, env) {
     }
     await env.DB.prepare("DELETE FROM login_attempts WHERE phone=?").bind(phone).run();
     const token = randomHex(32);
-    await env.DB.prepare("INSERT INTO sessions(customer_id,token_hash,expires_at) VALUES(?,?,datetime('now','+7 days'))").bind(user.id, await digest(token)).run();
-    return json({ ok: true, user: safeUser(user) }, 200, { "set-cookie": sessionCookie(token) });
+    await env.DB.prepare("INSERT INTO sessions(customer_id,token_hash,expires_at,mfa_verified) VALUES(?,?,datetime('now','+7 days'),?)").bind(user.id, await digest(token), user.role === "admin" ? 0 : 1).run();
+    return json({ ok: true, user: safeUser(user), mfaRequired: user.role === "admin", mfaSetupRequired: user.role === "admin" && Number(user.admin_totp_enabled) !== 1 }, 200, { "set-cookie": sessionCookie(token) });
   }
   if (path === "/api/auth/password/forgot" && method === "POST") {
     let b; try { b=await request.json(); } catch { return json({error:"Invalid request body."},400); }
@@ -200,8 +207,46 @@ async function handleApi(request, env) {
     return record ? json({ verified: true, document: record }) : json({ verified: false, error: "Document reference not found or no longer valid." }, 404);
   }
 
+    if (path === "/api/admin/mfa/setup" && method === "POST") {
+    const user=await currentUser(request,env);
+    if(!user||user.role!=="admin")return json({error:"Administrator sign-in required."},401);
+    if(Number(user.admin_totp_enabled)===1)return json({error:"Authenticator MFA is already enabled."},409);
+    let row=await env.DB.prepare("SELECT admin_totp_secret FROM customers WHERE id=?").bind(user.id).first();
+    let secret=row?.admin_totp_secret;
+    if(!secret){secret=base32Encode(crypto.getRandomValues(new Uint8Array(20)));await env.DB.prepare("UPDATE customers SET admin_totp_secret=? WHERE id=? AND admin_totp_enabled=0").bind(secret,user.id).run();}
+    const issuer="SPORE%20Microfinance",label=encodeURIComponent("SPORE Microfinance:"+user.phone);
+    return json({ok:true,secret,otpauthUri:"otpauth://totp/"+label+"?secret="+secret+"&issuer="+issuer+"&algorithm=SHA1&digits=6&period=30"});
+  }
+  if (path === "/api/admin/mfa/confirm" && method === "POST") {
+    const user=await currentUser(request,env);
+    if(!user||user.role!=="admin"||Number(user.admin_totp_enabled)===1)return json({error:"Administrator MFA setup is not available."},403);
+    let b;try{b=await request.json()}catch{return json({error:"Invalid request body."},400)}
+    const row=await env.DB.prepare("SELECT admin_totp_secret FROM customers WHERE id=?").bind(user.id).first();
+    if(!row?.admin_totp_secret||!await verifyTotp(row.admin_totp_secret,String(b.code||"")))return json({error:"Authenticator code is incorrect. Check your device time and try again."},400);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE customers SET admin_totp_enabled=1,updated_at=datetime('now') WHERE id=?").bind(user.id),
+      env.DB.prepare("UPDATE sessions SET mfa_verified=1 WHERE token_hash=?").bind(await digest(cookieToken(request))),
+      env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)").bind(user.id,"admin.mfa_enabled","customer",user.id,"{}")
+    ]);
+    const recoveryCodes=await makeRecoveryCodes(env,user.id);
+    return json({ok:true,recoveryCodes,message:"Authenticator MFA enabled. Save these one-time recovery codes now."});
+  }
+  if (path === "/api/auth/mfa/verify" && method === "POST") {
+    const user=await currentUser(request,env);
+    if(!user||user.role!=="admin"||Number(user.admin_totp_enabled)!==1)return json({error:"Administrator MFA challenge is not available."},403);
+    let b;try{b=await request.json()}catch{return json({error:"Invalid request body."},400)}
+    const row=await env.DB.prepare("SELECT admin_totp_secret FROM customers WHERE id=?").bind(user.id).first();
+    const code=String(b.code||"").trim();
+    let valid=!!row?.admin_totp_secret&&await verifyTotp(row.admin_totp_secret,code);
+    if(!valid)valid=await verifyRecoveryCode(env,user.id,code);
+    if(!valid)return json({error:"Authenticator or recovery code is invalid."},400);
+    await env.DB.prepare("UPDATE sessions SET mfa_verified=1 WHERE token_hash=?").bind(await digest(cookieToken(request))).run();
+    await audit(env,user,"admin.mfa_verified","customer",user.id);
+    return json({ok:true,message:"Administrator verification successful."});
+  }
+
   const user = await currentUser(request, env);
-  if (path === "/api/me" && method === "GET") return user ? json({ user: safeUser(user) }) : json({ error: "Please sign in." }, 401);
+  if (path === "/api/me" && method === "GET") return user ? json({ user: safeUser(user), mfaVerified: user.role !== "admin" || Number(user.mfa_verified) === 1, mfaSetupRequired: user.role === "admin" && Number(user.admin_totp_enabled) !== 1 }) : json({ error: "Please sign in." }, 401);
   if (path === "/api/loans" && method === "POST") {
     if (!user) return json({ error: "Please sign in to apply." }, 401);
     const kyc = await env.DB.prepare("SELECT status FROM kyc_profiles WHERE customer_id=?").bind(user.id).first();
@@ -256,6 +301,7 @@ async function handleApi(request, env) {
   if (path.startsWith("/api/admin/")) {
     if (!user) return json({ error: "Please sign in." }, 401);
     if (user.role !== "admin") return json({ error: "Administrator access required." }, 403);
+    if (Number(user.mfa_verified) !== 1) return json({ error: "Complete administrator authenticator verification first." }, 428);
 
     if (path === "/api/admin/kyc" && method === "GET") {
       const {results}=await env.DB.prepare("SELECT k.*,c.full_name,c.phone,c.email FROM kyc_profiles k JOIN customers c ON c.id=k.customer_id ORDER BY CASE k.status WHEN 'submitted' THEN 0 WHEN 'reviewing' THEN 1 ELSE 2 END,k.submitted_at DESC LIMIT 300").all();
@@ -328,7 +374,7 @@ async function handleApi(request, env) {
     if (path === "/api/admin/repayments" && method === "POST") {
       let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
       const applicationId = Number(b.applicationId), amount = Number(b.amount), reference = String(b.reference || "").slice(0, 100), note = String(b.note || "").slice(0, 500);
-      const loan = await env.DB.prepare("SELECT id,status FROM loan_applications WHERE id=?").bind(applicationId).first();
+      const loan = await env.DB.prepare("SELECT id,status,payment_version FROM loan_applications WHERE id=?").bind(applicationId).first();
       if (!loan || loan.status !== "approved" || !Number.isSafeInteger(amount) || amount < 1 || amount > 100000000) return json({ error: "Check the approved application and repayment amount." }, 422);
       const terms=await env.DB.prepare("SELECT total_payable_ugx FROM loan_terms WHERE application_id=?").bind(applicationId).first();
       if (!terms) return json({error:"Set approved loan terms before recording repayments."},409);
@@ -338,6 +384,8 @@ async function handleApi(request, env) {
       const {results:dueRows}=await env.DB.prepare("SELECT * FROM repayment_schedule WHERE application_id=? AND status!='paid' ORDER BY due_date,installment_no").bind(applicationId).all();
       let remaining=amount;
       const statements = [
+        env.DB.prepare("UPDATE loan_applications SET payment_version=payment_version+1 WHERE id=? AND payment_version=? AND status='approved'").bind(applicationId,Number(loan.payment_version||0)),
+        env.DB.prepare("INSERT INTO payment_assertions(ok) VALUES(changes())"),
         env.DB.prepare("INSERT INTO repayments(application_id,amount_ugx,reference,recorded_by,note) VALUES(?,?,?,?,?)").bind(applicationId,amount,reference||null,user.id,note)
       ];
       let allocated=0;
@@ -358,8 +406,15 @@ async function handleApi(request, env) {
       if (remaining!==0 || allocated!==amount) return json({error:"The repayment could not be fully allocated to the remaining schedule. No payment was recorded."},409);
       statements.push(env.DB.prepare("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)").bind(user.id,"repayment.recorded","loan_application",applicationId,JSON.stringify({amount,reference:reference||null})));
       // D1 batch executes these statements in one transaction, preventing partial payment/allocation writes.
-      const batchResult=await env.DB.batch(statements);
-      const repaymentId=batchResult[0]?.meta?.last_row_id;
+      statements.push(env.DB.prepare("DELETE FROM payment_assertions"));
+      let batchResult;
+      try { batchResult=await env.DB.batch(statements); }
+      catch(error) {
+        const latest=await env.DB.prepare("SELECT payment_version FROM loan_applications WHERE id=?").bind(applicationId).first();
+        if(latest && Number(latest.payment_version)!==Number(loan.payment_version||0))return json({error:"Another repayment was recorded at the same time. Refresh the loan balance and retry."},409);
+        throw error;
+      }
+      const repaymentId=batchResult[2]?.meta?.last_row_id;
       return json({ok:true,repaymentId,applicationId,amount,reference:reference||null,paidAt:new Date().toISOString(),allocated:amount-remaining,outstanding:outstanding-amount},201);
     }
     return json({ error: "Admin API route not found." }, 404);
