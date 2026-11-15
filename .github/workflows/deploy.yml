@@ -26,6 +26,11 @@ jobs:
       - name: Install Wrangler
         run: npm install --global wrangler
 
+      - name: Validate Worker and portal JavaScript
+        run: |
+          node --check src/worker.js
+          node -e "const fs=require('fs'),vm=require('vm'),html=fs.readFileSync('public/account.html','utf8');const scripts=[...html.matchAll(/<script>([\\s\\S]*?)<\\/script>/g)];for(const script of scripts)new vm.Script(script[1]);console.log('Portal inline JavaScript syntax is valid')"
+
       - name: Apply D1 migrations
         run: wrangler d1 migrations apply spore-microfinance-db --remote
         env:
