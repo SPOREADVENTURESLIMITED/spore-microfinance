@@ -115,6 +115,7 @@ async function handleApi(request, env) {
     let b; try { b=await request.json(); } catch { return json({error:"Invalid request body."},400); }
     const phone=String(b.phone||"").trim();
     if (!validPhone(phone)) return json({error:"Enter the phone number registered to your account."},422);
+    if (!env.RESET_CODE_PEPPER) return json({error:"Password recovery is not configured. Please contact support."},503);
     const recent=await env.DB.prepare("SELECT COUNT(*) AS total FROM password_resets WHERE phone=? AND created_at>datetime('now','-1 hour')").bind(phone).first();
     if (recent.total>=3) return json({error:"Too many reset requests. Try again in one hour."},429);
     const customer=await env.DB.prepare("SELECT id FROM customers WHERE phone=?").bind(phone).first();
