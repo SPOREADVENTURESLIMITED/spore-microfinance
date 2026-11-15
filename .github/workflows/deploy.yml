@@ -29,7 +29,20 @@ jobs:
       - name: Validate Worker and portal JavaScript
         run: |
           node --check src/worker.js
-          node -e "const fs=require('fs'),vm=require('vm'),html=fs.readFileSync('public/account.html','utf8');const scripts=[...html.matchAll(/<script>([\\s\\S]*?)<\\/script>/g)];for(const script of scripts)new vm.Script(script[1]);console.log('Portal inline JavaScript syntax is valid')"
+          node -e "const fs=require('fs'),vm=require('vm'),html=fs.readFileSync('public/account.html','utf8'),start=html.indexOf('<script>\\nconst 
+
+      - name: Apply D1 migrations
+        run: wrangler d1 migrations apply spore-microfinance-db --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy Worker and static assets
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+),end=html.lastIndexOf('</script>');if(start<0||end<0)throw Error('Portal script block not found');new vm.Script(html.slice(start+8,end));console.log('Portal inline JavaScript syntax is valid')"
 
       - name: Apply D1 migrations
         run: wrangler d1 migrations apply spore-microfinance-db --remote
