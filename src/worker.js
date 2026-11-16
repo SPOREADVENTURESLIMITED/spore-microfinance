@@ -178,11 +178,14 @@ async function handleApi(request, env) {
   }
   if (path === "/api/admin/bootstrap" && method === "POST") {
     if (!env.ADMIN_BOOTSTRAP_TOKEN) return json({ error: "Admin bootstrap is not configured. Add ADMIN_BOOTSTRAP_TOKEN as a Worker secret." }, 503);
+    if (!env.ADMIN_BOOTSTRAP_PHONE) return json({ error: "Admin bootstrap phone restriction is not configured. Add ADMIN_BOOTSTRAP_PHONE as a Worker secret." }, 503);
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
     if (!b.token || b.token !== env.ADMIN_BOOTSTRAP_TOKEN) return json({ error: "Invalid bootstrap token." }, 403);
     const count = await env.DB.prepare("SELECT COUNT(*) AS total FROM customers WHERE role='admin'").first();
     if (count.total > 0) return json({ error: "An administrator is already configured. Ask the existing administrator for access." }, 409);
     const phone = String(b.phone || "").trim();
+    const normalizePhone = value => String(value || "").replace(/\\D/g, "");
+    if (!phone || normalizePhone(phone) !== normalizePhone(env.ADMIN_BOOTSTRAP_PHONE)) return json({ error: "This phone number is not authorized for administrator bootstrap." }, 403);
     const user = await env.DB.prepare("SELECT id,full_name,phone,email,role FROM customers WHERE phone=?").bind(phone).first();
     if (!user) return json({ error: "Register a customer account with this phone number first, then bootstrap it." }, 404);
     await env.DB.prepare("UPDATE customers SET role='admin',updated_at=datetime('now') WHERE id=?").bind(user.id).run();
