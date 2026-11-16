@@ -186,8 +186,9 @@ async function handleApi(request, env) {
     const phone = String(b.phone || "").trim();
     const normalizePhone = value => String(value || "").replace(/\D/g, "");
     if (!phone || normalizePhone(phone) !== normalizePhone(env.ADMIN_BOOTSTRAP_PHONE)) return json({ error: "This phone number is not authorized for administrator bootstrap." }, 403);
-    const user = await env.DB.prepare("SELECT id,full_name,phone,email,role FROM customers WHERE phone=?").bind(phone).first();
-    if (!user) return json({ error: "Register a customer account with this phone number first, then bootstrap it." }, 404);
+    const candidates = await env.DB.prepare("SELECT id,full_name,phone,email,role FROM customers").all();
+    const user = (candidates.results || []).find(row => normalizePhone(row.phone) === normalizePhone(phone));
+    if (!user) return json({ error: "No registered customer account matches that phone number. Register the approved phone first, using the same country code." }, 404);
     await env.DB.prepare("UPDATE customers SET role='admin',updated_at=datetime('now') WHERE id=?").bind(user.id).run();
     await audit(env, { id: user.id }, "admin.bootstrapped", "customer", user.id);
     return json({ ok: true, message: "Administrator access enabled. Sign in again to refresh your session." });
