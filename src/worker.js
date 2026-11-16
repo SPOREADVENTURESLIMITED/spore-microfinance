@@ -184,7 +184,7 @@ async function handleApi(request, env) {
     const count = await env.DB.prepare("SELECT COUNT(*) AS total FROM customers WHERE role='admin'").first();
     if (count.total > 0) return json({ error: "An administrator is already configured. Ask the existing administrator for access." }, 409);
     const phone = String(b.phone || "").trim();
-    const normalizePhone = value => String(value || "").replace(/\\D/g, "");
+    const normalizePhone = value => String(value || "").replace(/\D/g, "");
     if (!phone || normalizePhone(phone) !== normalizePhone(env.ADMIN_BOOTSTRAP_PHONE)) return json({ error: "This phone number is not authorized for administrator bootstrap." }, 403);
     const user = await env.DB.prepare("SELECT id,full_name,phone,email,role FROM customers WHERE phone=?").bind(phone).first();
     if (!user) return json({ error: "Register a customer account with this phone number first, then bootstrap it." }, 404);
