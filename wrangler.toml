@@ -6,9 +6,26 @@ compatibility_date = "2026-11-15"
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
 
 [[d1_databases]]
 binding = "DB"
 database_name = "spore-microfinance-db"
 database_id = "28cc7e90-6b7f-4f60-bd52-f307b9bd30a0"
 migrations_dir = "migrations"
+
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+redact_query_string = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1.0
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.05
+persist = true
