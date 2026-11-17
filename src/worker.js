@@ -8,6 +8,14 @@ const randomHex = (size = 32) => {
   return hex(bytes);
 };
 const digest = async (value) => hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+async function constantTimeEqual(left, right) {
+  const encoder = new TextEncoder();
+  const [a,b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(String(left ?? ""))),
+    crypto.subtle.digest("SHA-256", encoder.encode(String(right ?? "")))
+  ]);
+  return crypto.subtle.timingSafeEqual(a,b);
+}
 async function passwordHash(password, salt) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 100000 }, key, 256);
@@ -30,7 +38,11 @@ function base32Encode(bytes){let bits=0,value=0,out="";for(const byte of bytes){
 function base32Decode(input){const clean=String(input||"").toUpperCase().replace(/=+$/,"").replace(/[^A-Z2-7]/g,"");let bits=0,value=0,out=[];for(const ch of clean){const n=B32.indexOf(ch);if(n<0)throw new Error("Invalid authenticator secret.");value=(value<<5)|n;bits+=5;if(bits>=8){out.push((value>>>(bits-8))&255);bits-=8;}}return new Uint8Array(out);}
 async function totpCode(secret,stepOffset=0){const counter=Math.floor(Date.now()/30000)+stepOffset;const msg=new Uint8Array(8);let n=counter;for(let i=7;i>=0;i--){msg[i]=n&255;n=Math.floor(n/256);}const key=await crypto.subtle.importKey("raw",base32Decode(secret),{name:"HMAC",hash:"SHA-1"},false,["sign"]);const mac=new Uint8Array(await crypto.subtle.sign("HMAC",key,msg));const off=mac[mac.length-1]&15;const bin=((mac[off]&127)<<24)|(mac[off+1]<<16)|(mac[off+2]<<8)|mac[off+3];return String(bin%1000000).padStart(6,"0");}
 async function verifyTotp(secret,code){for(const offset of [-1,0,1])if(await totpCode(secret,offset)===String(code))return true;return false;}
-async function verifyRecoveryCode(env,userId,code){const hash=await digest("spore-admin-recovery:"+userId+":"+String(code).replace(/[^a-f0-9]/gi,"").toLowerCase());const row=await env.DB.prepare("SELECT id FROM admin_mfa_recovery_codes WHERE customer_id=? AND code_hash=? AND used_at IS NULL").bind(userId,hash).first();if(!row)return false;await env.DB.prepare("UPDATE admin_mfa_recovery_codes SET used_at=datetime('now') WHERE id=? AND used_at IS NULL").bind(row.id).run();return true;}
+async function verifyRecoveryCode(env,userId,code){
+  const hash=await digest("spore-admin-recovery:"+userId+":"+String(code).replace(/[^a-f0-9]/gi,"").toLowerCase());
+  const used=await env.DB.prepare("UPDATE admin_mfa_recovery_codes SET used_at=datetime('now') WHERE id=(SELECT id FROM admin_mfa_recovery_codes WHERE customer_id=? AND code_hash=? AND used_at IS NULL LIMIT 1) AND used_at IS NULL RETURNING id").bind(userId,hash).first();
+  return !!used;
+}
 async function makeRecoveryCodes(env,userId){const codes=Array.from({length:10},()=>randomHex(8).toUpperCase());const stmts=[env.DB.prepare("DELETE FROM admin_mfa_recovery_codes WHERE customer_id=?").bind(userId)];for(const code of codes)stmts.push(env.DB.prepare("INSERT INTO admin_mfa_recovery_codes(customer_id,code_hash) VALUES(?,?)").bind(userId,await digest("spore-admin-recovery:"+userId+":"+code.toLowerCase())));await env.DB.batch(stmts);return codes;}
 const validPhone = (v) => /^\+?[0-9 ()-]{7,24}$/.test(v);
 const safeUser = (u) => ({ id: u.id, fullName: u.full_name, phone: u.phone, email: u.email, role: u.role });
@@ -69,9 +81,12 @@ async function createLoanSchedule(env, loan, admin, body = {}) {
       env.DB.prepare("DELETE FROM loan_terms WHERE application_id=?").bind(loan.id)
     ]);
   }
-  const rate = Number(body.monthlyRateBps ?? 200);
-  const start = /^\d{4}-\d{2}-\d{2}$/.test(String(body.disbursementDate || "")) ? body.disbursementDate : new Date().toISOString().slice(0,10);
-  const first = /^\d{4}-\d{2}-\d{2}$/.test(String(body.firstDueDate || "")) ? body.firstDueDate : addMonthsISO(start, 1);
+  if (body.monthlyRateBps === undefined || body.monthlyRateBps === null || String(body.monthlyRateBps).trim() === "") throw new Error("Enter the administrator-approved monthly interest rate before approving this loan.");
+  const rate = Number(body.monthlyRateBps);
+  const start = String(body.disbursementDate || new Date().toISOString().slice(0,10));
+  const first = String(body.firstDueDate || addMonthsISO(start, 1));
+  const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value+"T00:00:00Z")) && new Date(value+"T00:00:00Z").toISOString().slice(0,10)===value;
+  if (!validDate(start) || !validDate(first) || first <= start) throw new Error("Enter valid disbursement and first repayment dates; the first repayment must be after disbursement.");
   if (!Number.isSafeInteger(principal) || principal <= 0 || !Number.isInteger(months) || months <= 0) throw new Error("Loan principal or term is invalid.");
   if (!Number.isInteger(rate) || rate < 0 || rate > 10000) throw new Error("Monthly interest rate must be 0 to 100 percent in basis points.");
   const r = rate / 10000;
@@ -99,7 +114,14 @@ async function createLoanSchedule(env, loan, admin, body = {}) {
 async function handleApi(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (!env.DB) return json({ error: "Database is not configured." }, 503);
-  if (path === "/api/health" && method === "GET") return json({ ok: true, service: "Spore Microfinance API", databaseConfigured: true });
+  if (path === "/api/health" && method === "GET") {
+    try {
+      await env.DB.prepare("SELECT 1 AS ready").first();
+      return json({ ok: true, service: "Spore Microfinance API", database: "ready" });
+    } catch {
+      return json({ ok: false, service: "Spore Microfinance API", database: "unavailable" }, 503);
+    }
+  }
   if (path === "/api/settings" && method === "GET") {
     const {results}=await env.DB.prepare("SELECT setting_key,setting_value FROM site_settings").all();
     const settings=Object.fromEntries((results||[]).map(x=>[x.setting_key,x.setting_value]));
@@ -167,6 +189,7 @@ async function handleApi(request, env) {
     return json({ok:true,message:"If the number is registered, a password reset code has been sent by SMS."});
   }
   if (path === "/api/auth/password/reset" && method === "POST") {
+    if (!env.RESET_CODE_PEPPER) return json({error:"Password recovery is not configured. Please contact support."},503);
     let b; try { b=await request.json(); } catch { return json({error:"Invalid request body."},400); }
     const phone=String(b.phone||"").trim(), code=String(b.code||"").trim(), password=String(b.password||"");
     if (!validPhone(phone) || !/^\d{6}$/.test(code) || password.length<10 || password.length>128) return json({error:"Enter the registered phone, six-digit code and a password of 10–128 characters."},422);
@@ -195,7 +218,7 @@ async function handleApi(request, env) {
     if (!env.ADMIN_BOOTSTRAP_TOKEN) return json({ error: "Admin bootstrap is not configured. Add ADMIN_BOOTSTRAP_TOKEN as a Worker secret." }, 503);
     if (!env.ADMIN_BOOTSTRAP_PHONE) return json({ error: "Admin bootstrap phone restriction is not configured. Add ADMIN_BOOTSTRAP_PHONE as a Worker secret." }, 503);
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
-    if (!b.token || b.token !== env.ADMIN_BOOTSTRAP_TOKEN) return json({ error: "Invalid bootstrap token." }, 403);
+    if (!b.token || !await constantTimeEqual(b.token, env.ADMIN_BOOTSTRAP_TOKEN)) return json({ error: "Invalid bootstrap token." }, 403);
     const count = await env.DB.prepare("SELECT COUNT(*) AS total FROM customers WHERE role='admin'").first();
     if (count.total > 0) return json({ error: "An administrator is already configured. Ask the existing administrator for access." }, 409);
     const phone = String(b.phone || "").trim();
@@ -204,7 +227,8 @@ async function handleApi(request, env) {
     const candidates = await env.DB.prepare("SELECT id,full_name,phone,email,role FROM customers").all();
     const user = (candidates.results || []).find(row => normalizePhone(row.phone) === normalizePhone(phone));
     if (!user) return json({ error: "No registered customer account matches that phone number. Register the approved phone first, using the same country code." }, 404);
-    await env.DB.prepare("UPDATE customers SET role='admin',updated_at=datetime('now') WHERE id=?").bind(user.id).run();
+    const promoted = await env.DB.prepare("UPDATE customers SET role='admin',updated_at=datetime('now') WHERE id=? AND role='customer' AND NOT EXISTS (SELECT 1 FROM customers WHERE role='admin')").bind(user.id).run();
+    if (Number(promoted.meta?.changes || 0) !== 1) return json({ error: "Administrator setup was already completed or changed concurrently. Sign in again or contact the platform owner." }, 409);
     await audit(env, { id: user.id }, "admin.bootstrapped", "customer", user.id);
     return json({ ok: true, message: "Administrator access enabled. Sign in again to refresh your session." });
   }
@@ -507,7 +531,10 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
       try { return await handleApi(request, env); }
-      catch (error) { return json({ error: "The service could not complete this request." }, 500); }
+      catch (error) {
+        console.error(JSON.stringify({ event:"api_request_failed", method:request.method, path:url.pathname, error:error instanceof Error ? error.message : "unknown" }));
+        return json({ error: "The service could not complete this request." }, 500);
+      }
     }
     return env.ASSETS.fetch(request);
   }
