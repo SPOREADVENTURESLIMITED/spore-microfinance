@@ -100,6 +100,11 @@ async function handleApi(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (!env.DB) return json({ error: "Database is not configured." }, 503);
   if (path === "/api/health" && method === "GET") return json({ ok: true, service: "Spore Microfinance API", databaseConfigured: true });
+  if (path === "/api/settings" && method === "GET") {
+    const {results}=await env.DB.prepare("SELECT setting_key,setting_value FROM site_settings").all();
+    const settings=Object.fromEntries((results||[]).map(x=>[x.setting_key,x.setting_value]));
+    return json({settings:{name:settings.name||"SPORE MICROFINANCE",tagline:settings.tagline||"Responsible finance",phone:settings.phone||"",email:settings.email||"",website:settings.website||"",logoUrl:settings.logo_url||""}});
+  }
   if (path === "/api/auth/register" && method === "POST") {
     let b; try { b = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
     const name = String(b.fullName || "").trim(), phone = String(b.phone || "").trim(), email = String(b.email || "").trim().toLowerCase(), password = String(b.password || "");
@@ -123,12 +128,21 @@ async function handleApi(request, env) {
     await env.DB.prepare("DELETE FROM login_attempts WHERE attempted_at < datetime('now','-1 day')").run();
     const attempts = await env.DB.prepare("SELECT COUNT(*) AS total FROM login_attempts WHERE phone=? AND attempted_at > datetime('now','-15 minutes')").bind(phone).first();
     if (attempts.total >= 8) return json({ error: "Too many unsuccessful sign-in attempts. Please wait 15 minutes and try again." }, 429);
-    const user = await env.DB.prepare("SELECT * FROM customers WHERE phone=?").bind(phone).first();
+    let user = await env.DB.prepare("SELECT * FROM customers WHERE phone=?").bind(phone).first();
+    const normalizeLoginPhone = value => String(value || "").replace(/\D/g, "");
+    const configuredAdminPhone = String(env.ADMIN_BOOTSTRAP_PHONE || "");
+    if (!user && configuredAdminPhone && normalizeLoginPhone(phone) === normalizeLoginPhone(configuredAdminPhone)) {
+      user = await env.DB.prepare("SELECT * FROM customers WHERE role='admin' ORDER BY id DESC LIMIT 1").first();
+    }
     if (!user || (await passwordHash(password, user.password_salt)) !== user.password_hash) {
       await env.DB.prepare("INSERT INTO login_attempts(phone) VALUES(?)").bind(phone).run();
       return json({ error: "Phone number or password is incorrect." }, 401);
     }
     await env.DB.prepare("DELETE FROM login_attempts WHERE phone=?").bind(phone).run();
+    if (user.role === "admin" && configuredAdminPhone && normalizeLoginPhone(phone) === normalizeLoginPhone(configuredAdminPhone) && normalizeLoginPhone(user.phone) !== normalizeLoginPhone(configuredAdminPhone)) {
+      const collision = await env.DB.prepare("SELECT id FROM customers WHERE phone=? AND id<>?").bind(configuredAdminPhone,user.id).first();
+      if (!collision) { await env.DB.prepare("UPDATE customers SET phone=?,updated_at=datetime('now') WHERE id=?").bind(configuredAdminPhone,user.id).run(); user.phone=configuredAdminPhone; }
+    }
     const token = randomHex(32);
     await env.DB.prepare("INSERT INTO sessions(customer_id,token_hash,expires_at,mfa_verified) VALUES(?,?,datetime('now','+7 days'),?)").bind(user.id, await digest(token), user.role === "admin" ? 0 : 1).run();
     return json({ ok: true, user: safeUser(user), mfaRequired: user.role === "admin", mfaSetupRequired: user.role === "admin" && Number(user.admin_totp_enabled) !== 1 }, 200, { "set-cookie": sessionCookie(token) });
@@ -256,6 +270,13 @@ async function handleApi(request, env) {
     await audit(env,user,"admin.mfa_verified","customer",user.id);
     return json({ok:true,message:"Administrator verification successful."});
   }
+  if (path === "/api/admin/mfa/recovery-codes" && method === "POST") {
+    const user=await currentUser(request,env);
+    if(!user||user.role!=="admin"||Number(user.mfa_verified)!==1)return json({error:"Complete administrator MFA verification first."},403);
+    const recoveryCodes=await makeRecoveryCodes(env,user.id);
+    await audit(env,user,"admin.mfa_recovery_codes_regenerated","customer",user.id,{});
+    return json({ok:true,recoveryCodes,message:"New one-time recovery codes created. Previous codes are no longer valid."});
+  }
 
   const user = await currentUser(request, env);
   if (path === "/api/me" && method === "GET") return user ? json({ user: safeUser(user), mfaVerified: user.role !== "admin" || Number(user.mfa_verified) === 1, mfaSetupRequired: user.role === "admin" && Number(user.admin_totp_enabled) !== 1 }) : json({ error: "Please sign in." }, 401);
@@ -314,6 +335,36 @@ async function handleApi(request, env) {
     if (!user) return json({ error: "Please sign in." }, 401);
     if (user.role !== "admin") return json({ error: "Administrator access required." }, 403);
     if (Number(user.mfa_verified) !== 1) return json({ error: "Complete administrator authenticator verification first." }, 428);
+    if (path === "/api/admin/settings" && method === "PUT") {
+      let b;try{b=await request.json()}catch{return json({error:"Invalid request body."},400)}
+      const settings={name:String(b.name||"").trim(),tagline:String(b.tagline||"").trim(),phone:String(b.phone||"").trim(),email:String(b.email||"").trim(),website:String(b.website||"").trim(),logo_url:String(b.logoUrl||"").trim()};
+      if(settings.name.length<2||settings.name.length>100||settings.tagline.length>180||settings.phone.length>24||settings.email.length>254||settings.website.length>200||settings.logo_url.length>1000)return json({error:"Check the branding fields and length limits."},422);
+      if(settings.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(settings.email))return json({error:"Enter a valid contact email."},422);
+      for(const value of [settings.website,settings.logo_url])if(value){try{const parsed=new URL(value);if(parsed.protocol!=="https:")throw new Error()}catch{return json({error:"Website and logo URL must be valid HTTPS URLs."},422)}}
+      const statements=Object.entries(settings).map(([key,value])=>env.DB.prepare("INSERT INTO site_settings(setting_key,setting_value,updated_by,updated_at) VALUES(?,?,?,datetime('now')) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_by=excluded.updated_by,updated_at=datetime('now')").bind(key,value,user.id));
+      await env.DB.batch(statements);await audit(env,user,"site.branding_updated","site_settings",null,{fields:Object.keys(settings)});
+      return json({ok:true,message:"Organisation branding and contact details updated."});
+    }
+    if(path==="/api/admin/customers"&&method==="GET"){
+      const {results}=await env.DB.prepare("SELECT id,full_name,phone,email,created_at FROM customers WHERE role='customer' ORDER BY created_at DESC LIMIT 500").all();
+      return json({customers:results||[]});
+    }
+    const resetCustomer=path.match(/^\/api\/admin\/customers\/(\d+)\/send-password-reset$/);
+    if(resetCustomer&&method==="POST"){
+      if(!env.RESET_CODE_PEPPER)return json({error:"Password recovery is not configured. Set RESET_CODE_PEPPER."},503);
+      const customer=await env.DB.prepare("SELECT id,phone FROM customers WHERE id=? AND role='customer'").bind(Number(resetCustomer[1])).first();
+      if(!customer)return json({error:"Customer account not found."},404);
+      const recent=await env.DB.prepare("SELECT COUNT(*) AS total FROM password_resets WHERE phone=? AND created_at>datetime('now','-1 hour')").bind(customer.phone).first();
+      if(recent.total>=3)return json({error:"This customer has reached the password-reset limit. Try again later."},429);
+      const code=String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,"0");
+      const codeHash=await digest(customer.phone+":"+code+":"+env.RESET_CODE_PEPPER);
+      await env.DB.prepare("DELETE FROM password_resets WHERE phone=?").bind(customer.phone).run();
+      await env.DB.prepare("INSERT INTO password_resets(phone,code_hash,expires_at) VALUES(?,?,datetime('now','+10 minutes'))").bind(customer.phone,codeHash).run();
+      try{await sendSms(env,customer.phone,"Your Spore Microfinance password reset code is "+code+". It expires in 10 minutes. Do not share it.");}
+      catch{await env.DB.prepare("DELETE FROM password_resets WHERE phone=?").bind(customer.phone).run();return json({error:"SMS delivery failed. Check the SMS provider configuration and retry."},503)}
+      await audit(env,user,"customer.password_reset_requested","customer",customer.id,{});
+      return json({ok:true,message:"Password reset code sent to the customer's registered phone. The customer must complete the reset themselves."});
+    }
 
     if (path === "/api/admin/kyc" && method === "GET") {
       const {results}=await env.DB.prepare("SELECT k.*,c.full_name,c.phone,c.email FROM kyc_profiles k JOIN customers c ON c.id=k.customer_id ORDER BY CASE k.status WHEN 'submitted' THEN 0 WHEN 'reviewing' THEN 1 ELSE 2 END,k.submitted_at DESC LIMIT 300").all();
