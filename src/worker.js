@@ -449,6 +449,7 @@ async function handleApi(request, env) {
         if (!kyc || kyc.status !== "verified") return json({ error: "Loan approval is blocked until the customer's KYC is verified." }, 409);
       }
       if (status === "approved" && exists.status === "approved") return json({ error: "This loan is already approved." }, 409);
+      if (status === "approved" && b.rateConfirmed !== true) return json({ error: "Confirm the administrator-approved interest rate in the current dashboard before approving this loan." }, 422);
       // Build the complete schedule before changing the application to approved.
       // Schedule rows and loan terms are committed together by D1 batch.
       if (status === "approved") {
