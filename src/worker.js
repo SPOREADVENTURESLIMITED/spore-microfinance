@@ -132,7 +132,8 @@ async function handleApi(request, env) {
     const normalizeLoginPhone = value => String(value || "").replace(/\D/g, "");
     const configuredAdminPhone = String(env.ADMIN_BOOTSTRAP_PHONE || "");
     if (!user && configuredAdminPhone && normalizeLoginPhone(phone) === normalizeLoginPhone(configuredAdminPhone)) {
-      user = await env.DB.prepare("SELECT * FROM customers WHERE role='admin' ORDER BY id DESC LIMIT 1").first();
+      const admins = await env.DB.prepare("SELECT * FROM customers WHERE role='admin' ORDER BY id").all();
+      user = admins.results?.length === 1 ? admins.results[0] : null;
     }
     if (!user || (await passwordHash(password, user.password_salt)) !== user.password_hash) {
       await env.DB.prepare("INSERT INTO login_attempts(phone) VALUES(?)").bind(phone).run();
